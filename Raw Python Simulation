@@ -1,0 +1,1063 @@
+
+"""
+Decentralized Swarm Consensus Simulation for Disaster Triage UAVs
+
+ALGORITHM (v3):
+  Gossip does two things:
+  1. SURVIVOR DECONFLICTION — claim tags so drones don't double-assess
+  2. SPATIAL DECONFLICTION — share drone positions so drones spread out
+     and cover DIFFERENT areas instead of clustering
+
+  random: truly random waypoints, no position sharing → cluster
+  gossip: waypoints maximize distance from known drone positions → spread
+  centralized: same as gossip but perfect broadcast of all positions
+
+SETUP:  pip install matplotlib numpy scipy pandas tqdm
+
+USAGE:
+  python swarm_sim.py --mode visualize --protocol gossip      --ploss 0.0
+  python swarm_sim.py --mode visualize --protocol random      --ploss 0.5
+  python swarm_sim.py --mode visualize --protocol centralized --ploss 0.0
+  python swarm_sim.py --mode visualize --protocol gossip      --ge
+  python swarm_sim.py --mode benchmark
+  python swarm_sim.py --mode benchmark --trials 1000
+  python swarm_sim.py --mode analyze
+"""
+
+import argparse, copy, math, os, random, sys
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import matplotlib.patches as mpatches
+from matplotlib.lines import Line2D
+from matplotlib.gridspec import GridSpec
+import pandas as pd
+from scipy import stats as scipy_stats
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(it, **kw): return it
+
+# ══════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ══════════════════════════════════════════════════════════════════════
+FIELD        = 200
+N_SURV       = 30
+N_DRONES     = 3
+SPEED        = 12.0
+DT           = 0.5
+T_MAX        = 600_000
+R_DETECT     = 20.0
+R_ASSESS     = 5.0
+T_ASSESS     = 5.0
+R_COMM       = 250.0
+GOSSIP_K     = 2
+N_TRIALS     = 1000
+P_LOSS_LIST  = [0.0, 0.2, 0.5, 0.8]
+CRIT_RATE    = 0.3
+WP_CANDIDATES = 30   # candidates sampled when picking spread-out waypoint
+
+GE_P_GB      = 0.10
+GE_P_BG      = 0.25
+GE_PLOSS_G   = 0.05
+GE_PLOSS_B   = 0.80
+
+PROTO_INFO = {
+    "gossip":      ("Gossip Consensus",           "#2196F3"),
+    "random":      ("Random Search (No Comm)",    "#F44336"),
+    "centralized": ("Centralized (Perfect Comm)", "#4CAF50"),
+}
+
+_RANK = {"assessed": 4, "assessing": 3, "claimed": 2, "detected": 1}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════════════
+def _dist(ax, ay, bx, by):
+    return math.hypot(ax - bx, ay - by)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  DATA CLASSES
+# ══════════════════════════════════════════════════════════════════════
+class Survivor:
+    def __init__(self, sid):
+        self.id       = sid
+        self.x        = random.uniform(0, FIELD)
+        self.y        = random.uniform(0, FIELD)
+        self.critical = random.random() < CRIT_RATE
+        self.hr       = random.randint(50, 140)
+        self.rr       = random.randint(8,  30)
+        self.temp     = round(random.uniform(35.0, 40.0), 1)
+
+
+class Drone:
+    def __init__(self, did):
+        self.id           = did
+        self.x            = random.uniform(0, FIELD)
+        self.y            = random.uniform(0, FIELD)
+        # Survivor knowledge: sid → record
+        self.known        = {}
+        # Known drone positions (from gossip): drone_id → (x, y)
+        # random protocol: always empty; gossip/centralized: populated
+        self.known_drones = {}
+        self.target_id    = None
+        self.assessing_id = None
+        self.assess_start = None
+        self.waypoint     = (random.uniform(0, FIELD),
+                             random.uniform(0, FIELD))
+        self.state        = "SEARCH"
+        self.last_tx_peer = None
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  SIMULATION ENGINE
+# ══════════════════════════════════════════════════════════════════════
+class SwarmSim:
+    """
+    v3: gossip shares both survivor claims AND drone positions.
+    Drones use known positions to pick waypoints that maximise
+    distance from teammates → genuine spatial coverage coordination.
+    Random protocol never shares positions → random overlap/clustering.
+    """
+
+    def __init__(self, protocol="gossip", p_loss=0.0,
+                 ge_model=False, seed=0):
+        random.seed(seed)
+        self.protocol  = protocol
+        self.p_loss    = p_loss
+        self.ge_model  = ge_model
+        self.t         = 0.0
+        self.done      = False
+        self.t_all     = None
+        self.n_dup     = 0
+        self.bytes_tx  = 0
+        self.n_msgs    = 0
+
+        self.survivors    = [Survivor(i) for i in range(N_SURV)]
+        self.drones       = [Drone(i)    for i in range(N_DRONES)]
+        self.n_critical   = sum(s.critical for s in self.survivors)
+        self.first_crit_t = None
+        self.assessed_ids = set()
+        self.comm_flash   = []
+
+        self._ch = {}
+        if ge_model:
+            for i in range(N_DRONES):
+                for j in range(N_DRONES):
+                    if i != j:
+                        self._ch[(i, j)] = "good"
+
+    # ── packet drop ───────────────────────────────────────────────
+    def _drop(self, si, ri):
+        if self.ge_model:
+            k    = (si, ri)
+            st   = self._ch.get(k, "good")
+            drop = random.random() < (GE_PLOSS_B if st == "bad" else GE_PLOSS_G)
+            if st == "good":
+                if random.random() < GE_P_GB: self._ch[k] = "bad"
+            else:
+                if random.random() < GE_P_BG: self._ch[k] = "good"
+            return drop
+        return random.random() < self.p_loss
+
+    # ── merge survivor tables ─────────────────────────────────────
+    @staticmethod
+    def _merge(dst, src):
+        for sid, s in src.items():
+            if sid not in dst:
+                dst[sid] = copy.deepcopy(s)
+                continue
+            e  = dst[sid]
+            rs = _RANK.get(s["status"], 0)
+            re = _RANK.get(e["status"], 0)
+            if rs > re:
+                dst[sid] = copy.deepcopy(s)
+            elif rs == re:
+                sc = s.get("claimed_by")
+                ec = e.get("claimed_by")
+                if sc is not None and ec is not None and sc < ec:
+                    dst[sid] = copy.deepcopy(s)
+                elif sc is not None and ec is None:
+                    dst[sid] = copy.deepcopy(s)
+                elif s.get("ts", 0) > e.get("ts", 0):
+                    dst[sid] = copy.deepcopy(s)
+
+    # ── pick a spread-out waypoint ─────────────────────────────────
+    def _pick_waypoint(self, drone):
+        """
+        random protocol  → purely random (no position awareness)
+        gossip/centralized → sample WP_CANDIDATES points, keep the one
+                             that maximises minimum distance to all known
+                             drone positions including self.
+                             This spreads drones across uncovered field.
+        """
+        if self.protocol == "random" or not drone.known_drones:
+            return random.uniform(0, FIELD), random.uniform(0, FIELD)
+
+        # Positions to stay away from: teammates + self
+        occupied = list(drone.known_drones.values())
+        occupied.append((drone.x, drone.y))
+
+        best_pt    = None
+        best_score = -1.0
+        for _ in range(WP_CANDIDATES):
+            cx = random.uniform(0, FIELD)
+            cy = random.uniform(0, FIELD)
+            score = min(_dist(cx, cy, px, py) for px, py in occupied)
+            if score > best_score:
+                best_score = score
+                best_pt    = (cx, cy)
+        return best_pt
+
+    # ── phase 1: thermal detection ────────────────────────────────
+    def _detect(self):
+        for drone in self.drones:
+            for s in self.survivors:
+                if s.id in drone.known:
+                    continue
+                if _dist(drone.x, drone.y, s.x, s.y) < R_DETECT:
+                    drone.known[s.id] = {
+                        "x":          s.x,
+                        "y":          s.y,
+                        "status":     "detected",
+                        "claimed_by": None,
+                        "critical":   s.critical,
+                        "conf":       round(random.uniform(0.7, 1.0), 2),
+                        "ts":         self.t,
+                    }
+
+    # ── phase 2: communication ────────────────────────────────────
+    def _comm(self):
+        if self.protocol == "random":
+            return  # zero communication — no survivor data, no positions
+
+        for sender in self.drones:
+            in_range = [
+                d for d in self.drones
+                if d.id != sender.id
+                and _dist(sender.x, sender.y, d.x, d.y) <= R_COMM
+            ]
+            if not in_range:
+                continue
+
+            targets = (
+                random.sample(in_range, min(GOSSIP_K, len(in_range)))
+                if self.protocol == "gossip"
+                else in_range
+            )
+
+            # Message payload: survivor table + current position
+            msg_bytes = max(len(sender.known), 1) * 64 + N_DRONES * 16
+
+            for recip in targets:
+                if self._drop(sender.id, recip.id):
+                    continue
+
+                # Share survivor knowledge
+                self._merge(recip.known, sender.known)
+
+                # ── KEY FIX: share drone positions ──────────────
+                # Recipient now knows where sender is (and everyone
+                # sender knows about) → can pick spread-out waypoints
+                recip.known_drones[sender.id] = (sender.x, sender.y)
+                for did, pos in sender.known_drones.items():
+                    if did != recip.id:
+                        recip.known_drones[did] = pos
+
+                # Force re-evaluate target if gossip invalidated it
+                if (recip.target_id is not None
+                        and recip.target_id in recip.known):
+                    info = recip.known[recip.target_id]
+                    if (info["status"] == "claimed"
+                            and info["claimed_by"] != recip.id):
+                        recip.target_id = None
+
+                sender.last_tx_peer = recip.id
+                self.bytes_tx += msg_bytes
+                self.n_msgs   += 1
+                self.comm_flash.append(
+                    [sender.x, sender.y, recip.x, recip.y, 0])
+
+    # ── phase 3: movement and assessment ─────────────────────────
+    def _move(self):
+        for drone in self.drones:
+
+            # Update own position in known_drones (always current)
+            drone.known_drones[drone.id] = (drone.x, drone.y)
+
+            # ── finish ongoing assessment ──────────────────────
+            if drone.assessing_id is not None:
+                if self.t - drone.assess_start >= T_ASSESS:
+                    sid = drone.assessing_id
+                    if sid in self.assessed_ids:
+                        self.n_dup += 1
+                    else:
+                        self.assessed_ids.add(sid)
+                        s = self.survivors[sid]
+                        if s.critical and self.first_crit_t is None:
+                            self.first_crit_t = self.t
+                    drone.known[sid].update({
+                        "status":     "assessed",
+                        "claimed_by": None,
+                        "ts":         self.t,
+                    })
+                    drone.assessing_id = None
+                    drone.target_id    = None
+                    drone.state        = "SEARCH"
+                continue
+
+            # ── release invalid target ─────────────────────────
+            if drone.target_id is not None:
+                info     = drone.known.get(drone.target_id)
+                released = (
+                    info is None
+                    or info["status"] == "assessed"
+                    or (info["status"] in ("claimed", "assessing")
+                        and info.get("claimed_by") != drone.id)
+                )
+                if released:
+                    drone.target_id = None
+
+            # ── pick a new target ──────────────────────────────
+            if drone.target_id is None:
+                best_sid, best_d = None, float("inf")
+                for sid, info in drone.known.items():
+                    if info["status"] == "assessed":
+                        continue
+                    if (info["status"] in ("claimed", "assessing")
+                            and info.get("claimed_by") != drone.id):
+                        continue
+                    d = _dist(drone.x, drone.y, info["x"], info["y"])
+                    if d < best_d:
+                        best_d, best_sid = d, sid
+
+                if best_sid is not None:
+                    drone.known[best_sid].update({
+                        "status":     "claimed",
+                        "claimed_by": drone.id,
+                        "ts":         self.t,
+                    })
+                    drone.target_id = best_sid
+
+            # ── move toward target or spread-out waypoint ──────
+            if drone.target_id is not None:
+                info   = drone.known[drone.target_id]
+                tx, ty = info["x"], info["y"]
+                d      = _dist(drone.x, drone.y, tx, ty)
+                if d < R_ASSESS:
+                    drone.assessing_id = drone.target_id
+                    drone.assess_start = self.t
+                    drone.state        = "ASSESS"
+                    drone.known[drone.target_id].update({
+                        "status":     "assessing",
+                        "claimed_by": drone.id,
+                        "ts":         self.t,
+                    })
+                else:
+                    step    = min(SPEED * DT, d)
+                    drone.x += (tx - drone.x) / d * step
+                    drone.y += (ty - drone.y) / d * step
+                    drone.state = "MOVE"
+
+            else:
+                # No known unclaimed survivors → search open field
+                wx, wy = drone.waypoint
+                d = _dist(drone.x, drone.y, wx, wy)
+                if d < 2.0:
+                    # Pick next waypoint: spread-out for gossip/centralized,
+                    # random for random protocol
+                    drone.waypoint = self._pick_waypoint(drone)
+                else:
+                    step    = min(SPEED * DT, d)
+                    drone.x += (wx - drone.x) / d * step
+                    drone.y += (wy - drone.y) / d * step
+                drone.state = "SEARCH"
+
+    # ── termination ───────────────────────────────────────────────
+    def _check_done(self):
+        if len(self.assessed_ids) == N_SURV:
+            self.t_all = self.t
+            self.done  = True
+        elif self.t >= T_MAX:
+            self.done = True
+
+    # ── step / run ────────────────────────────────────────────────
+    def step(self):
+        if self.done:
+            return
+        self._detect()
+        self._comm()
+        self._move()
+        self._check_done()
+        self.t += DT
+
+    def run(self):
+        while not self.done:
+            self.step()
+        return self.metrics()
+
+    def metrics(self):
+        return {
+            "time_all_assessed": self.t_all,
+            "all_found":         len(self.assessed_ids) == N_SURV,
+            "assessed_count":    len(self.assessed_ids),
+            "first_crit_time":   self.first_crit_t,
+            "n_critical":        self.n_critical,
+            "n_dup":             self.n_dup,
+            "bytes_tx":          self.bytes_tx,
+            "n_msgs":            self.n_msgs,
+            "protocol":          self.protocol,
+            "p_loss":            self.p_loss,
+            "ge_model":          self.ge_model,
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ANIMATED VISUALIZER
+# ══════════════════════════════════════════════════════════════════════
+COMM_FADE   = 8
+TICKS_PER_F = 3
+
+_D_CLR = {"SEARCH": "#FFD740", "MOVE": "#FF9800", "ASSESS": "#F44336"}
+_S_CLR = {
+    "detected":  "#69F0AE",
+    "claimed":   "#FF9800",
+    "assessing": "#FF5252",
+    "assessed":  "#FFFFFF",
+    "critical":  "#FF5252",
+    "normal":    "#69F0AE",
+}
+
+
+def run_visualize(protocol="gossip", p_loss=0.0, ge_model=False, seed=0):
+    sim = SwarmSim(protocol=protocol, p_loss=p_loss,
+                   ge_model=ge_model, seed=seed)
+
+    fig = plt.figure(figsize=(16, 8.5), facecolor="#12121f")
+    gs  = GridSpec(3, 3, figure=fig,
+                   width_ratios=[4, 1.3, 1.5],
+                   height_ratios=[0.9, 3, 0.55],
+                   hspace=0.40, wspace=0.30)
+
+    ax_map  = fig.add_subplot(gs[:2, 0])
+    ax_stat = fig.add_subplot(gs[0,  1])
+    ax_cnt  = fig.add_subplot(gs[1,  1])
+    ax_bar  = fig.add_subplot(gs[1,  2])
+    ax_leg  = fig.add_subplot(gs[2,  :])
+
+    BG = "#0b0b18"
+    for ax in (ax_map, ax_stat, ax_cnt, ax_bar, ax_leg):
+        ax.set_facecolor(BG)
+
+    plabel, _ = PROTO_INFO[protocol]
+    llabel = "GE burst-loss" if ge_model else f"P_loss = {p_loss:.0%}"
+    fig.suptitle(
+        f"R.A.M.P.A.T. Swarm Simulation  ·  {plabel}  ·  {llabel}\n"
+        f"{N_DRONES} drones  ·  {N_SURV} survivors  ·  {FIELD}×{FIELD} m field",
+        color="white", fontsize=11, fontweight="bold", y=0.99, va="top"
+    )
+
+    ax_map.set_xlim(-5, FIELD + 5); ax_map.set_ylim(-5, FIELD + 5)
+    ax_map.set_aspect("equal")
+    ax_map.set_xlabel("X (m)", color="#9999bb", fontsize=9)
+    ax_map.set_ylabel("Y (m)", color="#9999bb", fontsize=9)
+    ax_map.tick_params(colors="#9999bb", labelsize=7)
+    for sp in ax_map.spines.values(): sp.set_color("#222244")
+    ax_map.grid(True, color="#1a1a33", lw=0.4)
+
+    s_init_clr = [
+        _S_CLR["critical"] if s.critical else _S_CLR["normal"]
+        for s in sim.survivors
+    ]
+    surv_sc = ax_map.scatter(
+        [s.x for s in sim.survivors], [s.y for s in sim.survivors],
+        c=s_init_clr, s=95, marker="*",
+        edgecolors="white", linewidths=0.5, zorder=4
+    )
+    drone_sc = ax_map.scatter(
+        [d.x for d in sim.drones], [d.y for d in sim.drones],
+        c=[_D_CLR["SEARCH"]] * N_DRONES, s=140, marker="^",
+        edgecolors="white", linewidths=0.7, zorder=5
+    )
+    # Waypoint lines (dashed) — shows where each drone is heading
+    wp_lines = [
+        ax_map.plot([], [], color="#444466", lw=0.8, ls="--", zorder=1)[0]
+        for _ in sim.drones
+    ]
+
+    assess_circles = [
+        plt.Circle((0,0), R_ASSESS, color="#FFD740",
+                   fill=False, lw=1.4, alpha=0.0)
+        for _ in sim.drones
+    ]
+    detect_circles = [
+        plt.Circle((0,0), R_DETECT, color="#64B5F6",
+                   fill=False, lw=0.5, ls="--", alpha=0.0)
+        for _ in sim.drones
+    ]
+    for c in assess_circles + detect_circles:
+        ax_map.add_patch(c)
+
+    MAX_CL = 80
+    cl_pool, comm_q = [], []
+
+    ax_stat.axis("off")
+    stat_txt = ax_stat.text(
+        0.05, 0.97, "", transform=ax_stat.transAxes,
+        color="white", fontsize=8.5, va="top", fontfamily="monospace"
+    )
+
+    ax_cnt.set_xlim(0, 1); ax_cnt.set_ylim(-0.3, N_SURV + 0.3)
+    ax_cnt.set_xlabel("Time (s)", color="#9999bb", fontsize=7)
+    ax_cnt.set_ylabel("# Assessed", color="#9999bb", fontsize=7)
+    ax_cnt.set_title("Survivors Assessed", color="white", fontsize=8.5)
+    ax_cnt.tick_params(colors="#9999bb", labelsize=6)
+    for sp in ax_cnt.spines.values(): sp.set_color("#222244")
+    ax_cnt.grid(True, color="#1a1a33", lw=0.3)
+    cnt_line, = ax_cnt.plot([], [], color="#69F0AE", lw=2)
+    t_hist, cnt_hist = [], []
+    crit_marked = False
+
+    ax_bar.set_ylim(0, N_DRONES + 0.5)
+    ax_bar.set_title("Drone States", color="white", fontsize=8.5)
+    ax_bar.tick_params(colors="#9999bb", labelsize=7)
+    for sp in ax_bar.spines.values(): sp.set_color("#222244")
+    ax_bar.grid(True, color="#1a1a33", lw=0.3, axis="y")
+    state_bars = ax_bar.bar(
+        ["SEARCH", "MOVE", "ASSESS"], [N_DRONES, 0, 0],
+        color=[_D_CLR["SEARCH"], _D_CLR["MOVE"], _D_CLR["ASSESS"]],
+        edgecolor="white", linewidth=0.4, width=0.55
+    )
+    ax_bar.set_yticks(range(0, N_DRONES + 1))
+    ax_bar.tick_params(axis="x", labelsize=7, colors="white")
+
+    ax_leg.axis("off")
+    leg_handles = [
+        Line2D([0],[0], marker="^", color="w",
+               markerfacecolor=_D_CLR["SEARCH"], markersize=9,
+               label="Drone – searching"),
+        Line2D([0],[0], marker="^", color="w",
+               markerfacecolor=_D_CLR["MOVE"], markersize=9,
+               label="Drone – en route"),
+        Line2D([0],[0], marker="^", color="w",
+               markerfacecolor=_D_CLR["ASSESS"], markersize=9,
+               label="Drone – assessing"),
+        Line2D([0],[0], marker="*", color="w",
+               markerfacecolor=_S_CLR["normal"], markersize=11,
+               label="Survivor (detected)"),
+        Line2D([0],[0], marker="*", color="w",
+               markerfacecolor=_S_CLR["claimed"], markersize=11,
+               label="Survivor (claimed)"),
+        Line2D([0],[0], marker="*", color="w",
+               markerfacecolor=_S_CLR["assessing"], markersize=11,
+               label="Survivor (assessing)"),
+        Line2D([0],[0], marker="*", color="w",
+               markerfacecolor=_S_CLR["assessed"], markersize=11,
+               label="Survivor (done ✓)"),
+        mpatches.Patch(color="#CE93D8", alpha=0.8,  label="Comm link"),
+        mpatches.Patch(color="#444466", alpha=0.8,  label="Search waypoint"),
+        mpatches.Patch(color="#64B5F6", alpha=0.25, label="Detect zone"),
+    ]
+    ax_leg.legend(
+        handles=leg_handles, loc="center", ncol=5,
+        fontsize=7.5, facecolor=BG, labelcolor="white",
+        edgecolor="#333355", framealpha=0.9
+    )
+
+    def update(frame):
+        nonlocal crit_marked
+        for _ in range(TICKS_PER_F):
+            if not sim.done: sim.step()
+
+        d_xy  = np.array([[d.x, d.y] for d in sim.drones])
+        d_clr = [_D_CLR.get(d.state, _D_CLR["SEARCH"]) for d in sim.drones]
+        drone_sc.set_offsets(d_xy)
+        drone_sc.set_color(d_clr)
+
+        for i, drone in enumerate(sim.drones):
+            assess_circles[i].center = (drone.x, drone.y)
+            detect_circles[i].center = (drone.x, drone.y)
+            assess_circles[i].set_alpha(0.38 if drone.state=="ASSESS" else 0.0)
+            detect_circles[i].set_alpha(0.13 if drone.state=="SEARCH" else 0.0)
+            # Draw waypoint line
+            if drone.state == "SEARCH" and drone.target_id is None:
+                wx, wy = drone.waypoint
+                wp_lines[i].set_data([drone.x, wx], [drone.y, wy])
+                wp_lines[i].set_alpha(0.5)
+            else:
+                wp_lines[i].set_alpha(0.0)
+
+        s_clr, s_sz = [], []
+        for s in sim.survivors:
+            best = None
+            for d in sim.drones:
+                if s.id in d.known:
+                    st = d.known[s.id]["status"]
+                    if best is None or _RANK.get(st,0) > _RANK.get(best,0):
+                        best = st
+            if best is None:
+                clr, sz = (_S_CLR["critical"] if s.critical
+                           else _S_CLR["normal"]), 95
+            elif best == "assessed":   clr, sz = _S_CLR["assessed"],  60
+            elif best == "assessing":  clr, sz = _S_CLR["assessing"], 120
+            elif best == "claimed":    clr, sz = _S_CLR["claimed"],   100
+            else:                      clr, sz = _S_CLR["detected"],   95
+            s_clr.append(clr); s_sz.append(sz)
+        surv_sc.set_color(s_clr)
+        surv_sc.set_sizes(s_sz)
+
+        while sim.comm_flash:
+            comm_q.append(sim.comm_flash.pop(0))
+        if len(comm_q) > MAX_CL:
+            comm_q[:] = comm_q[-MAX_CL:]
+        while len(cl_pool) < len(comm_q):
+            ln, = ax_map.plot([], [], color="#CE93D8", lw=0.8, alpha=0.0, zorder=2)
+            cl_pool.append(ln)
+        for ln in cl_pool: ln.set_alpha(0.0)
+        dead = []
+        for i, ev in enumerate(comm_q):
+            alpha = max(0.0, (COMM_FADE-ev[4])/COMM_FADE*0.75)
+            if i < len(cl_pool):
+                cl_pool[i].set_data([ev[0],ev[2]], [ev[1],ev[3]])
+                cl_pool[i].set_alpha(alpha)
+            ev[4] += 1
+            if ev[4] >= COMM_FADE: dead.append(i)
+        for i in reversed(dead):
+            if i < len(comm_q): comm_q.pop(i)
+
+        n_a  = len(sim.assessed_ids)
+        rate = n_a / max(sim.t, 1) * 60
+        fct  = sim.first_crit_t
+        stat_txt.set_text(
+            f"  Time:      {sim.t:>8.0f} s\n"
+            f"  Assessed:  {n_a:>4} / {N_SURV}\n"
+            f"  Critical:  {sim.n_critical}\n"
+            f"  1st Crit:  " +
+            (f"{fct:>8.0f} s\n" if fct else "       —\n") +
+            f"  Rate:      {rate:>5.2f}/min\n"
+            f"  Msgs sent: {sim.n_msgs:>7}\n"
+            f"  kBytes TX: {sim.bytes_tx/1000:>6.1f}\n"
+            f"  Dup scans: {sim.n_dup:>5}\n" +
+            ("  STATUS:    DONE ✓\n" if sim.done else
+             "  STATUS:    Running…\n")
+        )
+        t_hist.append(sim.t); cnt_hist.append(n_a)
+        if t_hist: ax_cnt.set_xlim(0, max(t_hist)*1.05 or 1)
+        cnt_line.set_data(t_hist, cnt_hist)
+        if fct and not crit_marked:
+            ax_cnt.axvline(x=fct, color="#FF5252", lw=1.2, ls=":")
+            ax_cnt.text(fct, N_SURV*0.85, " 1st\n crit",
+                        color="#FF5252", fontsize=6)
+            crit_marked = True
+
+        sc = {"SEARCH":0,"MOVE":0,"ASSESS":0}
+        for d in sim.drones:
+            sc[d.state if d.state in sc else "SEARCH"] += 1
+        for bar, k in zip(state_bars, ["SEARCH","MOVE","ASSESS"]):
+            bar.set_height(sc[k])
+
+        return (drone_sc, surv_sc,
+                *assess_circles, *detect_circles, *wp_lines,
+                cnt_line, stat_txt, *state_bars)
+
+    ani = animation.FuncAnimation(
+        fig, update, frames=None, interval=50,
+        blit=False, cache_frame_data=False,
+    )
+    plt.show()
+    return sim.metrics()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  BATCH BENCHMARK
+# ══════════════════════════════════════════════════════════════════════
+def run_benchmark(n_trials=N_TRIALS):
+    os.makedirs("sim_data", exist_ok=True)
+    records = []
+    configs = (
+        [(p, pl, False)
+         for p in ("gossip","random","centralized")
+         for pl in P_LOSS_LIST]
+        + [(p, 0.0, True) for p in ("gossip","random")]
+    )
+    total = len(configs) * n_trials
+    print(f"\n  ▶  Benchmark | {n_trials} trials per condition")
+    print(f"  {len(configs)} conditions × {n_trials} trials = {total} total runs")
+    print("  (Ctrl-C to cancel)\n")
+
+    with tqdm(total=total, desc="Benchmarking", unit="trial") as pbar:
+        for proto, ploss, ge in configs:
+            for trial in range(n_trials):
+                m = SwarmSim(protocol=proto, p_loss=ploss,
+                             ge_model=ge, seed=trial).run()
+                m["trial"]      = trial
+                m["loss_model"] = "gilbert_elliott" if ge else "bernoulli"
+                records.append(m)
+                pbar.update(1)
+
+    df = pd.DataFrame(records)
+    df["all_found"] = df["all_found"].astype(bool)
+    df["ge_model"]  = df["ge_model"].astype(bool)
+    path = "sim_data/swarm_results.csv"
+    df.to_csv(path, index=False)
+    print(f"\n  ✓  {len(df)} records  →  {path}")
+    _print_table(df)
+    return df
+
+
+def _print_table(df):
+    b = df[df["loss_model"] == "bernoulli"]
+    print("\n╔══ BERNOULLI PACKET LOSS ══════════════════════════════════════════════╗")
+    print(f"  {'Protocol':<14}{'P_loss':>7}  {'MeanTime(s)':>12}{'±Std':>8}"
+          f"  {'1stCrit(s)':>11}{'DupScans':>10}{'MissRate':>10}")
+    print("  " + "─"*73)
+    for proto in ("gossip","random","centralized"):
+        sub = b[b["protocol"]==proto]
+        for pl in P_LOSS_LIST:
+            row  = sub[sub["p_loss"]==pl]
+            v    = row["time_all_assessed"].dropna()
+            fc   = row["first_crit_time"].dropna()
+            dup  = row["n_dup"]
+            miss = (row["all_found"]==False).sum()
+            tot  = len(row)
+            print(f"  {proto:<14}{pl:>7.0%}"
+                  f"  {v.mean():>10.0f}" if len(v) else f"  {proto:<14}{pl:>7.0%}  {'N/A':>10}",
+                  end="")
+            print(f"{v.std():>6.0f}"   if len(v)  else f"{'N/A':>6}", end="")
+            print(f"  {fc.mean():>9.0f}" if len(fc) else f"  {'N/A':>9}", end="")
+            print(f"{dup.mean():>8.2f}" if len(dup) else f"{'N/A':>8}", end="")
+            print(f"{miss/tot:>9.0%}"   if tot     else f"{'N/A':>9}")
+        print("  " + "─"*73)
+
+    ge = df[df["loss_model"]=="gilbert_elliott"]
+    if len(ge)==0: return
+    print("\n╔══ GILBERT-ELLIOTT BURST LOSS ══════════════════════════════════════════╗")
+    print(f"  {'Protocol':<14}  {'MeanTime(s)':>12}{'±Std':>8}"
+          f"  {'1stCrit(s)':>11}{'DupScans':>10}{'MissRate':>10}")
+    print("  "+"─"*65)
+    for proto in ("gossip","random"):
+        sub  = ge[ge["protocol"]==proto]
+        v    = sub["time_all_assessed"].dropna()
+        fc   = sub["first_crit_time"].dropna()
+        dup  = sub["n_dup"]
+        miss = (sub["all_found"]==False).sum()
+        tot  = len(sub)
+        print(f"  {proto:<14}"
+              f"  {v.mean():>10.0f}{v.std():>6.0f}"
+              f"  {fc.mean():>9.0f}{dup.mean():>8.2f}{miss/tot:>9.0%}")
+    print()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ANALYSIS & FIGURES
+# ══════════════════════════════════════════════════════════════════════
+def run_analyze(df=None):
+    os.makedirs("figures", exist_ok=True)
+    if df is None:
+        path = "sim_data/swarm_results.csv"
+        if not os.path.exists(path):
+            sys.exit("  ✗  No data. Run: python swarm_sim.py --mode benchmark")
+        df = pd.read_csv(path)
+        df["all_found"] = df["all_found"].astype(bool)
+        df["ge_model"]  = df["ge_model"].astype(bool)
+
+    b  = df[df["loss_model"]=="bernoulli"]
+    ge = df[df["loss_model"]=="gilbert_elliott"]
+
+    plt.style.use("dark_background")
+    plt.rcParams.update({
+        "figure.dpi":130,"font.size":10,
+        "axes.facecolor":"#0b0b18","axes.edgecolor":"#333355",
+        "xtick.color":"white","ytick.color":"white",
+        "axes.labelcolor":"white","axes.titlecolor":"white",
+        "grid.color":"#1a1a33","grid.linewidth":0.4,
+    })
+
+    def _agg(sub, col):
+        xs,ys,errs,missed = [],[],[],[]
+        for pl in P_LOSS_LIST:
+            row  = sub[sub["p_loss"]==pl]
+            vals = row[col].dropna()
+            mr   = (row["all_found"]==False).sum()/max(len(row),1)
+            if len(vals):
+                xs.append(pl*100); ys.append(vals.mean())
+                errs.append(vals.sem()*1.96); missed.append(mr*100)
+        return xs,ys,errs,missed
+
+    # Fig 1: Time vs packet loss
+    fig,axes = plt.subplots(1,3,figsize=(17,5.2),facecolor="#12121f")
+    n = b[b["protocol"]=="gossip"]["trial"].max()+1 if len(b) else N_TRIALS
+    fig.suptitle(f"Swarm Performance vs Packet Loss  (n={n:.0f} trials/condition)",
+                 fontsize=12, fontweight="bold", color="white")
+    for ax,col,ylabel,title in [
+        (axes[0],"time_all_assessed",
+         "Mean Time — All Assessed (s)","Assessment Time vs Packet Loss"),
+        (axes[1],"first_crit_time",
+         "Mean Time — First Critical (s)","First Critical Survivor Time"),
+    ]:
+        for proto in ("gossip","random","centralized"):
+            lbl,clr = PROTO_INFO[proto]
+            xs,ys,errs,_ = _agg(b[b["protocol"]==proto], col)
+            ax.errorbar(xs,ys,yerr=errs,label=lbl,color=clr,
+                        marker="o",lw=2,markersize=8,capsize=5)
+        ax.set_xlabel("Packet Loss (%)"); ax.set_ylabel(ylabel)
+        ax.set_title(title,fontsize=10); ax.legend(fontsize=8); ax.grid(True)
+
+    ax = axes[2]
+    bv   = b[(b["protocol"]=="centralized")&(b["p_loss"]==0.0)]["time_all_assessed"].dropna()
+    base = bv.mean() if len(bv) else 1.0
+    for proto in ("gossip","random"):
+        lbl,clr = PROTO_INFO[proto]
+        xs,ys,errs,_ = _agg(b[b["protocol"]==proto],"time_all_assessed")
+        ax.errorbar(xs,[y/base for y in ys],yerr=[e/base for e in errs],
+                    label=lbl,color=clr,marker="o",lw=2,markersize=8,capsize=5)
+    ax.axhline(1.0,   color="#4CAF50",lw=1.3,ls="--",
+               label=f"Centralized(0%) = {base:.0f} s")
+    ax.axhline(1/0.85,color="#FF9800",lw=1.3,ls=":",label="85% threshold")
+    ax.fill_between([0,80],[1.0,1.0],[1/0.85,1/0.85],color="#FF9800",alpha=0.08)
+    ax.set_xlabel("Packet Loss (%)"); ax.set_ylabel("Normalised Time")
+    ax.set_title("Gossip Efficiency vs Hypothesis",fontsize=10)
+    ax.legend(fontsize=7.5); ax.grid(True)
+    plt.tight_layout()
+    plt.savefig("figures/fig1_time_vs_ploss.png",
+                bbox_inches="tight",facecolor="#12121f")
+    print("  ✓  figures/fig1_time_vs_ploss.png"); plt.show()
+
+    # Fig 2: CDF + miss rate
+    fig,axes = plt.subplots(1,2,figsize=(13,5.2),facecolor="#12121f")
+    fig.suptitle("Mission Success Rate & Time Distribution",
+                 fontsize=12,fontweight="bold",color="white")
+    ax = axes[0]
+    for proto in ("gossip","random","centralized"):
+        lbl,clr = PROTO_INFO[proto]
+        xs,_,_,missed = _agg(b[b["protocol"]==proto],"time_all_assessed")
+        ax.plot(xs,missed,label=lbl,color=clr,marker="o",lw=2.2,markersize=8)
+    ax.set_xlabel("Packet Loss (%)"); ax.set_ylabel("Mission Failure Rate (%)")
+    ax.set_title("Mission Failure Rate"); ax.legend(fontsize=9); ax.grid(True)
+    ax = axes[1]; ax.set_title("CDF of Assessment Times")
+    for proto,lw in [("gossip",2.5),("random",1.8)]:
+        clr=PROTO_INFO[proto][1]; name=PROTO_INFO[proto][0]
+        for pl,ls in [(0.0,"-"),(0.5,"--"),(0.8,":")]:
+            v=b[(b["protocol"]==proto)&(b["p_loss"]==pl)]["time_all_assessed"].dropna().sort_values().values
+            if len(v):
+                ax.plot(v,np.arange(1,len(v)+1)/len(v),ls=ls,lw=lw,color=clr,
+                        label=f"{name}  {int(pl*100)}% loss",alpha=0.85)
+    ax.set_xlabel("Time (s)"); ax.set_ylabel("CDF")
+    ax.legend(fontsize=7.5,ncol=2); ax.grid(True)
+    plt.tight_layout()
+    plt.savefig("figures/fig2_miss_cdf.png",
+                bbox_inches="tight",facecolor="#12121f")
+    print("  ✓  figures/fig2_miss_cdf.png"); plt.show()
+
+    # Fig 3: Duplicate scans + bandwidth
+    fig,axes = plt.subplots(1,2,figsize=(13,5.2),facecolor="#12121f")
+    fig.suptitle("Deconfliction Effectiveness & Comm Overhead",
+                 fontsize=12,fontweight="bold",color="white")
+    for ax,col,ylabel,title,protos in [
+        (axes[0],"n_dup",
+         "Mean Duplicate Assessments",
+         "Wasted Scans (KEY deconfliction metric)",
+         ("gossip","random","centralized")),
+        (axes[1],"bytes_tx",
+         "Mean Bytes Transmitted",
+         "Communication Overhead",
+         ("gossip","centralized")),
+    ]:
+        for proto in protos:
+            lbl,clr = PROTO_INFO[proto]
+            xs,ys,errs,_ = _agg(b[b["protocol"]==proto],col)
+            ax.errorbar(xs,ys,yerr=errs,label=lbl,color=clr,
+                        marker="o",lw=2,markersize=8,capsize=5)
+        ax.set_xlabel("Packet Loss (%)"); ax.set_ylabel(ylabel)
+        ax.set_title(title); ax.legend(fontsize=9); ax.grid(True)
+    plt.tight_layout()
+    plt.savefig("figures/fig3_comm_overhead.png",
+                bbox_inches="tight",facecolor="#12121f")
+    print("  ✓  figures/fig3_comm_overhead.png"); plt.show()
+
+    # Fig 4: GE vs Bernoulli
+    if len(ge)>0:
+        fig,axes = plt.subplots(1,2,figsize=(13,5.2),facecolor="#12121f")
+        fig.suptitle(f"GE Burst-Loss vs Bernoulli\n"
+                     f"(p_gb={GE_P_GB}, p_bg={GE_P_BG}, "
+                     f"burst≈{1/GE_P_BG:.0f} pkts)",
+                     fontsize=11,fontweight="bold",color="white")
+        ax=axes[0]; ax.set_title("Distribution: Bernoulli 0% vs GE Burst")
+        for proto in ("gossip","random"):
+            clr=PROTO_INFO[proto][1]; name=PROTO_INFO[proto][0]
+            b0=b[(b["protocol"]==proto)&(b["p_loss"]==0.0)]["time_all_assessed"].dropna()
+            gv=ge[ge["protocol"]==proto]["time_all_assessed"].dropna()
+            if len(b0): ax.hist(b0,bins=30,density=True,alpha=0.42,color=clr,
+                                edgecolor="white",lw=0.3,label=f"{name} – B 0%")
+            if len(gv): ax.hist(gv,bins=30,density=True,alpha=0.42,color=clr,
+                                edgecolor="white",lw=0.3,hatch="//",
+                                label=f"{name} – GE")
+        ax.set_xlabel("Time (s)"); ax.set_ylabel("Density")
+        ax.legend(fontsize=7.5); ax.grid(True)
+        ax=axes[1]; ax.set_title("Mean Time: Bernoulli 0% vs GE Burst")
+        protos_ge=["gossip","random"]; x=np.arange(len(protos_ge)); w=0.33
+        bm,be,gm,ge_e=[],[],[],[]
+        for proto in protos_ge:
+            bv=b[(b["protocol"]==proto)&(b["p_loss"]==0.0)]["time_all_assessed"].dropna()
+            gv=ge[ge["protocol"]==proto]["time_all_assessed"].dropna()
+            bm.append(bv.mean() if len(bv) else 0); be.append(bv.sem()*1.96 if len(bv) else 0)
+            gm.append(gv.mean() if len(gv) else 0); ge_e.append(gv.sem()*1.96 if len(gv) else 0)
+        ax.bar(x-w/2,bm,w,yerr=be,label="Bernoulli 0%",color="#4CAF50",capsize=5,
+               error_kw={"ecolor":"white"},edgecolor="white",lw=0.4)
+        ax.bar(x+w/2,gm,w,yerr=ge_e,label="GE Burst",color="#FF9800",capsize=5,
+               error_kw={"ecolor":"white"},edgecolor="white",lw=0.4)
+        ax.set_xticks(x); ax.set_xticklabels([PROTO_INFO[p][0] for p in protos_ge],fontsize=9)
+        ax.set_ylabel("Mean Time (s)"); ax.legend(fontsize=9); ax.grid(True,axis="y")
+        plt.tight_layout()
+        plt.savefig("figures/fig4_ge_comparison.png",
+                    bbox_inches="tight",facecolor="#12121f")
+        print("  ✓  figures/fig4_ge_comparison.png"); plt.show()
+
+    # Fig 5: Speed-up + dup scans at 50%
+    fig,axes = plt.subplots(1,2,figsize=(13,5.2),facecolor="#12121f")
+    fig.suptitle("Gossip Speed-Up & Deconfliction Advantage",
+                 fontsize=12,fontweight="bold",color="white")
+    ax=axes[0]; ax.set_title("Speed-Up vs Random  (random/gossip mean time)")
+    sus_xs,sus_ys=[],[]
+    for pl in P_LOSS_LIST:
+        gv=b[(b["protocol"]=="gossip")&(b["p_loss"]==pl)]["time_all_assessed"].dropna()
+        rv=b[(b["protocol"]=="random")&(b["p_loss"]==pl)]["time_all_assessed"].dropna()
+        if len(gv) and len(rv):
+            sus_xs.append(pl*100); sus_ys.append(rv.mean()/gv.mean())
+    ax.bar(sus_xs,sus_ys,width=12,color="#2196F3",
+           edgecolor="white",lw=0.5,alpha=0.85)
+    ax.axhline(2.0,color="#FF9800",lw=1.3,ls="--",label="2× hypothesis")
+    ax.axhline(1.0,color="#888888",lw=0.8,ls=":")
+    ax.set_xlabel("Packet Loss (%)"); ax.set_ylabel("Speed-Up Ratio")
+    ax.set_xticks([int(x) for x in sus_xs])
+    ax.legend(fontsize=9); ax.grid(True,axis="y")
+    ax=axes[1]; ax.set_title("Duplicate Scans by Protocol (50% loss)")
+    dm,de,dc,dn=[],[],[],[]
+    for proto in ("gossip","random","centralized"):
+        dv=b[(b["protocol"]==proto)&(b["p_loss"]==0.5)]["n_dup"].dropna()
+        if len(dv):
+            dm.append(dv.mean()); de.append(dv.sem()*1.96)
+            dc.append(PROTO_INFO[proto][1]); dn.append(PROTO_INFO[proto][0])
+    yp=np.arange(len(dn))
+    ax.barh(yp,dm,xerr=de,color=dc,edgecolor="white",lw=0.5,
+            error_kw={"ecolor":"white"},capsize=5)
+    ax.set_yticks(yp); ax.set_yticklabels(dn,fontsize=9)
+    ax.set_xlabel("Mean Duplicate Assessments"); ax.grid(True,axis="x")
+    plt.tight_layout()
+    plt.savefig("figures/fig5_speedup.png",
+                bbox_inches="tight",facecolor="#12121f")
+    print("  ✓  figures/fig5_speedup.png"); plt.show()
+
+    _run_stats(b, ge)
+
+
+def _run_stats(b, ge):
+    print("\n"+"═"*68)
+    print("  STATISTICAL SIGNIFICANCE TESTS")
+    print("═"*68)
+
+    def _ttest(ga, gb, label):
+        a=ga["time_all_assessed"].dropna().values
+        bv=gb["time_all_assessed"].dropna().values
+        if min(len(a),len(bv))<2:
+            print(f"  {label}: insufficient data"); return
+        t,p=scipy_stats.ttest_ind(a,bv,equal_var=False)
+        d=(a.mean()-bv.mean())/np.sqrt((a.std()**2+bv.std()**2)/2)
+        sig=("***" if p<0.001 else "**" if p<0.01 else "*" if p<0.05 else "ns")
+        print(f"\n  {label}")
+        print(f"    A: {a.mean():.1f} ± {a.std():.1f} s"
+              f"   B: {bv.mean():.1f} ± {bv.std():.1f} s")
+        print(f"    Welch t={t:+.3f}   p={p:.5f}  {sig}"
+              f"   Cohen's d={d:.3f}")
+
+    _ttest(b[(b.protocol=="gossip")&(b.p_loss==0.0)],
+           b[(b.protocol=="centralized")&(b.p_loss==0.0)],
+           "H1 · Gossip(0%) vs Centralized(0%)")
+    _ttest(b[(b.protocol=="gossip")&(b.p_loss==0.5)],
+           b[(b.protocol=="gossip")&(b.p_loss==0.0)],
+           "H2 · Gossip(50%) vs Gossip(0%)  ← KEY")
+    _ttest(b[(b.protocol=="gossip")&(b.p_loss==0.8)],
+           b[(b.protocol=="gossip")&(b.p_loss==0.0)],
+           "H3 · Gossip(80%) vs Gossip(0%)")
+    _ttest(b[(b.protocol=="gossip")&(b.p_loss==0.5)],
+           b[(b.protocol=="random")&(b.p_loss==0.5)],
+           "H4 · Gossip(50%) vs Random(50%)  ← coordination benefit")
+    _ttest(b[(b.protocol=="gossip")&(b.p_loss==0.0)],
+           b[(b.protocol=="random")&(b.p_loss==0.0)],
+           "H5 · Gossip(0%) vs Random(0%)   ← baseline")
+    if len(ge):
+        _ttest(ge[ge.protocol=="gossip"],ge[ge.protocol=="random"],
+               "H6 · GE-Gossip vs GE-Random")
+
+    print("\n  ── Duplicate Scan Tests ────────────────────────────────────")
+    for pl in [0.0,0.5,0.8]:
+        gd=b[(b.protocol=="gossip")&(b.p_loss==pl)]["n_dup"].dropna().values
+        rd=b[(b.protocol=="random")&(b.p_loss==pl)]["n_dup"].dropna().values
+        if min(len(gd),len(rd))<2: continue
+        t,p=scipy_stats.ttest_ind(gd,rd,equal_var=False)
+        d=(gd.mean()-rd.mean())/np.sqrt((gd.std()**2+rd.std()**2)/2)
+        sig=("***" if p<0.001 else "**" if p<0.01 else "*" if p<0.05 else "ns")
+        print(f"\n  Dup: Gossip({int(pl*100)}%) vs Random({int(pl*100)}%)")
+        print(f"    Gossip={gd.mean():.2f}±{gd.std():.2f}"
+              f"  Random={rd.mean():.2f}±{rd.std():.2f}")
+        print(f"    t={t:+.3f}  p={p:.5f}  {sig}  d={d:.3f}")
+
+    c0 =b[(b.protocol=="centralized")&(b.p_loss==0.0)]["time_all_assessed"].dropna()
+    g50=b[(b.protocol=="gossip")&(b.p_loss==0.5)]["time_all_assessed"].dropna()
+    if len(c0) and len(g50):
+        ratio=g50.mean()/c0.mean(); eff=1.0/ratio
+        print(f"\n  ── Key Efficiency Result ─────────────────────────────────")
+        print(f"  Centralized(0%) : {c0.mean():.1f} s")
+        print(f"  Gossip(50%)     : {g50.mean():.1f} s")
+        print(f"  Efficiency      : {eff:.1%}")
+        print(f"  ≥85% met?       : {'YES ✓' if eff>=0.85 else 'NO ✗'}")
+
+    g0=b[(b.protocol=="gossip")&(b.p_loss==0.0)]["time_all_assessed"].dropna()
+    r0=b[(b.protocol=="random")&(b.p_loss==0.0)]["time_all_assessed"].dropna()
+    if len(g0) and len(r0):
+        su=r0.mean()/g0.mean()
+        print(f"\n  Speed-up vs Random (0%) : {su:.2f}×")
+        print(f"  ≥2× met?                : {'YES ✓' if su>=2.0 else 'NO ✗'}")
+    print("═"*68+"\n")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════
+def main():
+    ap = argparse.ArgumentParser(
+        description="R.A.M.P.A.T. Swarm Simulation v3 — ISEF 2026",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
+    )
+    ap.add_argument("--mode",
+                    choices=["visualize","benchmark","analyze"],
+                    default="visualize")
+    ap.add_argument("--protocol",
+                    choices=["gossip","random","centralized"],
+                    default="gossip")
+    ap.add_argument("--ploss",  type=float, default=0.0)
+    ap.add_argument("--ge",     action="store_true")
+    ap.add_argument("--seed",   type=int,   default=42)
+    ap.add_argument("--trials", type=int,   default=N_TRIALS)
+    args = ap.parse_args()
+
+    if args.mode == "visualize":
+        print(f"\n  ▶  Visualize | {args.protocol} | "
+              f"p_loss={args.ploss:.0%} | GE={args.ge} | seed={args.seed}")
+        m = run_visualize(protocol=args.protocol, p_loss=args.ploss,
+                          ge_model=args.ge, seed=args.seed)
+        print(f"\n  Final metrics: {m}")
+    elif args.mode == "benchmark":
+        run_benchmark(n_trials=args.trials)
+    elif args.mode == "analyze":
+        print("\n  ▶  Analyze | loading sim_data/swarm_results.csv")
+        run_analyze()
+
+
+if __name__ == "__main__":
+    main()
